@@ -52,7 +52,7 @@ private val screenMod = Modifier.fillMaxSize()
 private fun ScreenColumn(content: @Composable ColumnScope.() -> Unit) {
     Column(
         screenMod.fadeTop().verticalScroll(rememberScrollState())
-            .statusBarsPadding().padding(start = 22.dp, end = 22.dp, top = 70.dp, bottom = 160.dp),
+            .statusBarsPadding().padding(start = 22.dp, end = 22.dp, top = 70.dp, bottom = 118.dp),
         content = content,
     )
 }

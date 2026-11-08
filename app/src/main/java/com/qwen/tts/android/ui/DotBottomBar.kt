@@ -83,8 +83,10 @@ private const val LH = 180f             // полувысота линзы
 private const val LR = 150f             // скругление линзы
 private const val CLAMP_INSET = 145f    // насколько центр линзы отступает от края (линза вылезает ~на четверть)
 private const val MARK_W = 360f
-private const val MARK_H = 260f
-private const val MARK_R = 110f
+private const val MARK_H = 230f
+private const val MARK_R = 100f
+private const val MARK_OUTER = 62f      // отступ плашки от скруглённых краёв таблетки
+private const val MARK_INNER = 26f      // отступ плашки от перегородок
 private const val PAD_H = 130f          // запас под вылезающую линзу
 private const val PAD_V = 30f
 
@@ -289,7 +291,7 @@ fun DotBottomBar(
     onSelect: (Int) -> Unit,
     onSettingsClick: () -> Unit,
     modifier: Modifier = Modifier,
-    barHeight: Dp = 88.dp,
+    barHeight: Dp = 64.dp,
     markVisible: Boolean = true,
     settingsActive: Boolean = false,
     dark: Boolean = false,
@@ -315,9 +317,15 @@ fun DotBottomBar(
 
     val markIdx = if (dragging) hover else selectedIndex
     val markAlpha by animateFloatAsState(if (markVisible) 1f else 0f, tween(260), label = "markAlpha")
-    val markX by animateFloatAsState(
-        if (pillW > 0) geo.centers[markIdx.coerceIn(0, 2)] else 0f,
-        spring(dampingRatio = 0.6f, stiffness = Spring.StiffnessMediumLow), label = "mark",
+    // плашка активной вкладки занимает свою «ячейку» между перегородками и не вылезает за них
+    val mi = markIdx.coerceIn(0, 2)
+    val markL by animateFloatAsState(
+        if (pillW > 0) (if (mi == 0) MARK_OUTER else geo.dividers[mi - 1] + MARK_INNER) else 0f,
+        spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMediumLow), label = "markL",
+    )
+    val markR by animateFloatAsState(
+        if (pillW > 0) (if (mi == 2) geo.w - MARK_OUTER else geo.dividers[mi] - MARK_INNER) else 0f,
+        spring(dampingRatio = 0.7f, stiffness = Spring.StiffnessMedium), label = "markR",
     )
 
     LaunchedEffect(selectedIndex, pillW) {
@@ -329,7 +337,7 @@ fun DotBottomBar(
     }
 
     Row(
-        modifier.fillMaxWidth().padding(horizontal = 24.dp, vertical = 24.dp),
+        modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box(
@@ -373,8 +381,8 @@ fun DotBottomBar(
                 if (pillW == 0) return@Canvas
                 drawRoundRect(
                     pal.mark.copy(alpha = pal.mark.alpha * markAlpha),
-                    topLeft = Offset((markX - MARK_W / 2) * u, (LY - MARK_H / 2) * u),
-                    size = Size(MARK_W * u, MARK_H * u),
+                    topLeft = Offset(markL * u, (LY - MARK_H / 2) * u),
+                    size = Size(max(0f, markR - markL) * u, MARK_H * u),
                     cornerRadius = CornerRadius(MARK_R * u),
                 )
             }
@@ -476,7 +484,7 @@ fun DotBottomBar(
             }
         }
 
-        Spacer(Modifier.width(14.dp))
+        Spacer(Modifier.width(10.dp))
         GearButton(size = barHeight * (354f / PH0), u = u, pal = pal, active = settingsActive, onClick = onSettingsClick)
     }
 }
