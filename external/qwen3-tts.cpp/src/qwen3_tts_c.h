@@ -35,6 +35,7 @@ typedef struct {
     const char* speaker;
     // Values <= 0 keep the native default.
     float vocoder_left_context_sec;
+    int64_t seed; // 0 = random per synthesis
 } qwen3_tts_params_t;
 
 typedef struct {
