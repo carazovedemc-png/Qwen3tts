@@ -14,6 +14,11 @@ class QwenEngine : AutoCloseable {
         val instruction: String? = null,
         val speaker: String? = null,
         val maxAudioTokens: Int = 512,
+        val temperature: Float = 0.9f,
+        val topP: Float = 1.0f,
+        val topK: Int = 50,
+        val repetitionPenalty: Float = 1.05f,
+        val seed: Long = -1L,
     )
 
     class NativeResult(

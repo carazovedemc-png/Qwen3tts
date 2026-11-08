@@ -76,6 +76,22 @@ static jobject make_native_result(JNIEnv* env, qwen3_tts_result_t c_result) {
                           (jlong)c_result.t_total_ms);
 }
 
+static void apply_sampling_params(JNIEnv* env, jobject params, qwen3_tts_params_t* p) {
+    if (params == nullptr) return;
+    jclass cls = env->GetObjectClass(params);
+    jfieldID f = env->GetFieldID(cls, "temperature", "F");
+    if (f) p->temperature = env->GetFloatField(params, f); else env->ExceptionClear();
+    f = env->GetFieldID(cls, "topP", "F");
+    if (f) p->top_p = env->GetFloatField(params, f); else env->ExceptionClear();
+    f = env->GetFieldID(cls, "topK", "I");
+    if (f) p->top_k = env->GetIntField(params, f); else env->ExceptionClear();
+    f = env->GetFieldID(cls, "repetitionPenalty", "F");
+    if (f) p->repetition_penalty = env->GetFloatField(params, f); else env->ExceptionClear();
+    f = env->GetFieldID(cls, "seed", "J");
+    if (f) p->seed = (int64_t)env->GetLongField(params, f); else env->ExceptionClear();
+    env->DeleteLocalRef(cls);
+}
+
 static void fill_params_from_java(JNIEnv* env, jobject params, qwen3_tts_params_t* c_params,
                                   jstring* j_instruction, const char** c_instruction,
                                   jstring* j_speaker, const char** c_speaker) {
@@ -85,6 +101,7 @@ static void fill_params_from_java(JNIEnv* env, jobject params, qwen3_tts_params_
     if (params != nullptr && g_max_audio_tokens_field != nullptr) {
         c_params->max_audio_tokens = env->GetIntField(params, g_max_audio_tokens_field);
     }
+    apply_sampling_params(env, params, c_params);
     if (params != nullptr && g_instruction_field != nullptr) {
         *j_instruction = (jstring)env->GetObjectField(params, g_instruction_field);
         if (*j_instruction != nullptr) {
@@ -388,6 +405,7 @@ JNIEXPORT jobject JNICALL Java_com_qwen_tts_studio_engine_QwenEngine_nativeSynth
     if (params != nullptr && g_max_audio_tokens_field != nullptr) {
         c_params.max_audio_tokens = env->GetIntField(params, g_max_audio_tokens_field);
     }
+    apply_sampling_params(env, params, &c_params);
     if (params != nullptr && g_instruction_field != nullptr) {
         j_instruction = (jstring)env->GetObjectField(params, g_instruction_field);
         if (j_instruction != nullptr) {

@@ -5,21 +5,26 @@ import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
 /**
- * Process-wide owner of the native engine. Shared by the UI (MainViewModel) and the
- * local API server so both can synthesize without loading the model twice.
- * Every native call must happen under [lock] (the native context is not thread-safe).
+ * Process-wide owner of the native engine. Shared by the UI, the batch queue, voice previews
+ * and the local API server so the model is loaded once. Every native call must run under [lock].
  */
 object EngineHost {
     val lock = ReentrantLock()
 
     @Volatile var engine: QwenEngine? = null
     @Volatile var loadedTalker: String? = null
+    @Volatile private var loadedBackend: Int = -1
 
-    fun ensureLoaded(modelDir: String, talkerName: String, threads: Int): QwenEngine = lock.withLock {
-        if (engine != null && loadedTalker != talkerName) release()
+    fun ensureLoaded(
+        modelDir: String,
+        talkerName: String,
+        threads: Int,
+        backend: Int = QwenEngine.BACKEND_CPU,
+    ): QwenEngine = lock.withLock {
+        if (engine != null && (loadedTalker != talkerName || loadedBackend != backend)) release()
         val native = engine ?: QwenEngine().also { engine = it }
-        if (!native.setBackendPreference(QwenEngine.BACKEND_CPU)) {
-            error("Could not switch backend to CPU")
+        if (!native.setBackendPreference(backend)) {
+            native.setBackendPreference(QwenEngine.BACKEND_CPU)
         }
         native.setCpuThreads(threads)
         if (loadedTalker != talkerName) {
@@ -29,6 +34,7 @@ object EngineHost {
                 error(message)
             }
             loadedTalker = talkerName
+            loadedBackend = backend
         }
         native
     }
@@ -37,6 +43,7 @@ object EngineHost {
         engine?.close()
         engine = null
         loadedTalker = null
+        loadedBackend = -1
     }
 
     fun defaultThreads(): Int {
@@ -47,4 +54,9 @@ object EngineHost {
             else -> available.coerceAtLeast(1)
         }
     }
+
+    /** Bit mask of backends compiled into the native library (bit 0 CPU, bit 1 GPU). */
+    fun compiledBackendMask(): Int = runCatching {
+        engine?.getCompiledBackendMask() ?: QwenEngine().use { it.getCompiledBackendMask() }
+    }.getOrDefault(1)
 }

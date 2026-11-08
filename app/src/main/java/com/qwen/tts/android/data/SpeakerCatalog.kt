@@ -43,4 +43,4 @@ object SpeakerCatalog {
 fun resolveVoiceName(voiceId: String?, voices: List<VoiceProfileEntity>): String =
     SpeakerCatalog.byVoiceId(voiceId)?.displayName
         ?: voices.firstOrNull { it.voiceId == voiceId }?.name
-        ?: "Random (base model)"
+        ?: "Случайный голос"

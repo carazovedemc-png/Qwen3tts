@@ -95,13 +95,16 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.qwen.tts.android.data.AudioImporter
+import com.qwen.tts.android.data.AudioExporter
+import com.qwen.tts.android.data.BatchQueue
+import com.qwen.tts.android.data.ExportFormat
+import com.qwen.tts.android.data.MiaSettings
+import com.qwen.tts.android.data.Player
+import com.qwen.tts.android.engine.Synth
 import com.qwen.tts.android.data.SpeakerCatalog
 import com.qwen.tts.android.data.resolveVoiceName
 import com.qwen.tts.android.engine.EngineHost
 import com.qwen.tts.android.server.ApiServerService
-import com.qwen.tts.android.ui.PresetVoiceBrowser
-import com.qwen.tts.android.ui.ServerPanel
-import com.qwen.tts.android.ui.VoicePickerSheetV2
 import com.qwen.tts.android.data.VoiceRecorder
 import com.qwen.tts.android.data.db.GenerationEntity
 import com.qwen.tts.android.data.db.QwenDatabase
@@ -227,10 +230,10 @@ internal object QwenModel {
 }
 
 data class QwenTtsUiState(
-    val text: String = "Hello World from Qwen3 TTS running on Android on-device!",
+    val text: String = "Привет! Меня зовут Мия. Я здесь, чтобы помочь и ответить на все ваши вопросы.",
     val selectedModelId: String = QwenModel.defaultVariant.id,
     val selectedBackendId: String = defaultBackendOption.id,
-    val selectedVoiceId: String? = null,
+    val selectedVoiceId: String? = "preset:vivian",
     val activeBackendName: String? = null,
     val modelReady: Boolean = false,
     val loaded: Boolean = false,
@@ -251,7 +254,7 @@ data class QwenTtsUiState(
     val maxAudioTokens: Int = 512,
     val cpuThreads: Int = 0,
     val selectedCpuThreads: Int = 0,
-    val selectedLanguageId: Int = 2050,
+    val selectedLanguageId: Int = 2069,
     val tokenizeMillis: Long = 0,
     val encodeMillis: Long = 0,
     val generateMillis: Long = 0,
@@ -280,6 +283,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(
         QwenTtsUiState(
+            selectedCpuThreads = MiaSettings.get(application).threads,
             modelReady = isModelReady(QwenModel.defaultVariant),
             downloadTotalBytes = QwenModel.defaultVariant.totalBytes,
         ),
@@ -306,6 +310,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateCpuThreads(value: Int) {
         if (_uiState.value.busy) return
+        MiaSettings.get(getApplication()).threads = value
         _uiState.update { it.copy(selectedCpuThreads = value, cpuThreads = value) }
         engine?.setCpuThreads(value)
     }
@@ -477,9 +482,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                             native.synthesize(
                                 text = text,
                                 speakerEmbeddingPath = selectedVoice?.speakerEmbeddingPath,
-                                params = QwenEngine.NativeParams(
-                                    languageId = _uiState.value.selectedLanguageId,
-                                    speaker = preset?.key,
+                                params = Synth.params(
+                                    getApplication(),
+                                    _uiState.value.selectedLanguageId,
+                                    preset?.key,
+                                    MiaSettings.get(getApplication()).instruction,
                                 ),
                             )
                         }
@@ -808,7 +815,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun ensureEngineLoaded(variant: ModelVariant): QwenEngine {
-        val native = EngineHost.ensureLoaded(modelDir.absolutePath, variant.talkerName, selectedCpuThreadCount())
+        val native = EngineHost.ensureLoaded(modelDir.absolutePath, variant.talkerName, selectedCpuThreadCount(), Synth.backendPreference(getApplication()))
         val caps = native.getModelCapabilities()
         _uiState.update {
             it.copy(
@@ -1046,11 +1053,153 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    // ---- Mia additions -------------------------------------------------------------
+    private val player = Player()
+    private var previewJob: kotlinx.coroutines.Job? = null
+    private val _preview = MutableStateFlow<String?>(null)
+    val previewing = _preview.asStateFlow()
+
+    val queue = BatchQueue(
+        application, viewModelScope,
+        voiceId = { _uiState.value.selectedVoiceId },
+        languageId = { _uiState.value.selectedLanguageId },
+    )
+
+    private fun say(message: String) = _uiState.update { it.copy(snackbarMessage = message) }
+
+    /** 0 = not downloaded, 1 = on disk, 2 = loaded in memory. */
+    fun variantStatus(id: String): Int {
+        val v = QwenModel.variantById(id)
+        return when {
+            !isModelReady(v) -> 0
+            EngineHost.loadedTalker == v.talkerName -> 2
+            else -> 1
+        }
+    }
+
+    fun downloadAll(ids: List<String>) {
+        if (_uiState.value.downloading) return
+        viewModelScope.launch {
+            startBusy(status = "Preparing model download", downloading = true)
+            val result = runCatching {
+                withContext(Dispatchers.IO) {
+                    modelDir.mkdirs()
+                    ids.map { QwenModel.variantById(it) }.filterNot { isModelReady(it) }.forEach { v ->
+                        _uiState.update {
+                            it.copy(downloadProgress = 0f, downloadBytes = 0L, downloadTotalBytes = v.totalBytes, status = "Downloading ${v.label}")
+                        }
+                        downloadFiles(v)
+                    }
+                }
+            }
+            result.fold(
+                onSuccess = { stopBusyTicker(); refreshModelState("Model ready") },
+                onFailure = { t ->
+                    stopBusyTicker()
+                    _uiState.update { it.copy(busy = false, downloading = false, status = "Download failed", error = t.message ?: "Download failed") }
+                },
+            )
+        }
+    }
+
+    fun loadVariant(id: String) {
+        if (_uiState.value.busy) return
+        if (_uiState.value.selectedModelId != id) selectModel(id)
+        if (EngineHost.loadedTalker == QwenModel.variantById(id).talkerName) return
+        _uiState.update { it.copy(loaded = false) }
+        loadModel()
+    }
+
+    fun unloadModel() {
+        if (_uiState.value.busy) return
+        stopAudio()
+        EngineHost.release()
+        _uiState.update { it.copy(loaded = false, activeBackendName = null, status = "Model unloaded") }
+    }
+
+    fun deleteVariant(id: String) {
+        if (_uiState.value.busy) return
+        val v = QwenModel.variantById(id)
+        if (EngineHost.loadedTalker == v.talkerName) { stopAudio(); EngineHost.release() }
+        File(modelDir, v.talkerName).delete()
+        val othersExist = QwenModel.variants.any { it.id != id && File(modelDir, it.talkerName).isFile }
+        if (!othersExist) v.files.forEach { File(modelDir, it.name).delete() }
+        _uiState.update { it.copy(loaded = false, activeBackendName = null) }
+        refreshModelState("Model deleted")
+    }
+
+    fun restartEngine() {
+        if (_uiState.value.busy) return
+        EngineHost.release()
+        _uiState.update { it.copy(loaded = false, activeBackendName = null) }
+    }
+
+    private fun previewPhrase(languageId: Int) = when (languageId) {
+        2050 -> "Hello! My name is Mia."
+        2053 -> "Hallo! Ich heiße Mia."
+        2054 -> "¡Hola! Me llamo Mia."
+        2055 -> "你好，我是米娅。"
+        2058 -> "こんにちは、ミアです。"
+        2061 -> "Bonjour ! Je m'appelle Mia."
+        2064 -> "안녕하세요, 저는 미아예요."
+        else -> "Привет! Меня зовут Мия."
+    }
+
+    fun previewVoice(voiceId: String?) {
+        val key = voiceId ?: "random"
+        val wasThis = _preview.value == key
+        previewJob?.cancel(); player.stop(); _preview.value = null
+        if (wasThis) return
+        val app = getApplication<Application>()
+        val voice = Synth.resolve(app, voiceId)
+        if (voice == null) { say("Голос не найден"); return }
+        if (!Synth.isReady(app, voice.talker)) { say("Сначала скачайте нужную модель в Настройках"); return }
+        _preview.value = key
+        previewJob = viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val lang = _uiState.value.selectedLanguageId
+                val samples = Synth.run(app, previewPhrase(lang), voice, lang, null)
+                if (_preview.value == key) {
+                    player.play(samples, Synth.SAMPLE_RATE)
+                    kotlinx.coroutines.delay(samples.size * 1000L / Synth.SAMPLE_RATE + 200)
+                }
+            } catch (t: Throwable) {
+                if (t !is kotlinx.coroutines.CancellationException) say(t.message ?: "Preview failed")
+            } finally {
+                if (_preview.value == key) _preview.value = null
+            }
+        }
+    }
+
+    fun exportLatest(format: ExportFormat, share: Boolean) {
+        val gen = generations.value.firstOrNull() ?: run { say("Сначала озвучьте текст"); return }
+        val app = getApplication<Application>()
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                val (samples, rate) = AudioExporter.readWav(File(gen.wavPath))
+                val name = gen.text.take(24).ifBlank { "voice" } + "-" + (System.currentTimeMillis() % 100000)
+                AudioExporter.export(app, samples, rate, name, format) to name
+            }.fold(
+                onSuccess = { (uri, name) ->
+                    if (share) {
+                        val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                            type = format.mime
+                            putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                            addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        app.startActivity(android.content.Intent.createChooser(send, null).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                    } else say("Сохранено: Music/Mia ai voice/$name.${format.ext}")
+                },
+                onFailure = { say(it.message ?: "Не удалось сохранить") },
+            )
+        }
+    }
+
     override fun onCleared() {
         recorder.cancel()
         stopAudio()
         stopBusyTicker()
-        if (!ApiServerService.isRunning) EngineHost.release()
+        if (!ApiServerService.isRunning && !MiaSettings.get(getApplication()).keepAlive) EngineHost.release()
         super.onCleared()
     }
 }
@@ -1060,736 +1209,8 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableEdgeToEdge()
-        setContent {
-            QwenTtsTheme {
-                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    QwenTtsApp()
-                }
-            }
-        }
-    }
-}
-
-private sealed class AppDestination(
-    val route: String,
-    val label: String,
-    val icon: @Composable () -> Unit,
-) {
-    object Studio : AppDestination("studio", "Studio", { Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = null) })
-    object Voices : AppDestination("voices", "Voices", { Icon(Icons.Default.RecordVoiceOver, contentDescription = null) })
-    object History : AppDestination("history", "History", { Icon(Icons.Default.History, contentDescription = null) })
-    object Settings : AppDestination("settings", "Settings", { Icon(Icons.Default.Settings, contentDescription = null) })
-}
-
-private val appDestinations = listOf(
-    AppDestination.Studio,
-    AppDestination.Voices,
-    AppDestination.History,
-    AppDestination.Settings,
-)
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun QwenTtsApp(viewModel: MainViewModel = viewModel()) {
-    val navController = rememberNavController()
-    val backStackEntry by navController.currentBackStackEntryAsState()
-    val currentRoute = backStackEntry?.destination?.route ?: AppDestination.Studio.route
-    val state by viewModel.uiState.collectAsState()
-    val snackbarHostState = remember { SnackbarHostState() }
-
-    LaunchedEffect(state.snackbarMessage) {
-        val message = state.snackbarMessage ?: return@LaunchedEffect
-        snackbarHostState.showSnackbar(message)
-        viewModel.clearSnackbarMessage()
-    }
-
-    Scaffold(
-        snackbarHost = { SnackbarHost(snackbarHostState) },
-        bottomBar = {
-            NavigationBar {
-                appDestinations.forEach { destination ->
-                    NavigationBarItem(
-                        selected = currentRoute == destination.route,
-                        onClick = {
-                            navController.navigate(destination.route) {
-                                launchSingleTop = true
-                                restoreState = true
-                                popUpTo(AppDestination.Studio.route) { saveState = true }
-                            }
-                        },
-                        icon = destination.icon,
-                        label = { Text(destination.label) },
-                    )
-                }
-            }
-        },
-    ) { padding ->
-        NavHost(
-            navController = navController,
-            startDestination = AppDestination.Studio.route,
-            modifier = Modifier.padding(padding),
-            enterTransition = {
-                val direction = if (destinationIndex(targetState.destination.route) >= destinationIndex(initialState.destination.route)) {
-                    AnimatedContentTransitionScope.SlideDirection.Start
-                } else {
-                    AnimatedContentTransitionScope.SlideDirection.End
-                }
-                slideIntoContainer(direction, animationSpec = tween(260))
-            },
-            exitTransition = {
-                val direction = if (destinationIndex(targetState.destination.route) >= destinationIndex(initialState.destination.route)) {
-                    AnimatedContentTransitionScope.SlideDirection.Start
-                } else {
-                    AnimatedContentTransitionScope.SlideDirection.End
-                }
-                slideOutOfContainer(direction, animationSpec = tween(260))
-            },
-            popEnterTransition = {
-                slideIntoContainer(AnimatedContentTransitionScope.SlideDirection.End, animationSpec = tween(260))
-            },
-            popExitTransition = {
-                slideOutOfContainer(AnimatedContentTransitionScope.SlideDirection.End, animationSpec = tween(260))
-            },
-        ) {
-            composable(AppDestination.Studio.route) {
-                StudioScreen(viewModel)
-            }
-            composable(AppDestination.Voices.route) {
-                VoicesScreen(viewModel)
-            }
-            composable(AppDestination.History.route) {
-                HistoryScreen(viewModel)
-            }
-            composable(AppDestination.Settings.route) {
-                SettingsScreen(viewModel)
-            }
-        }
-    }
-}
-
-private fun destinationIndex(route: String?): Int =
-    appDestinations.indexOfFirst { it.route == route }.takeIf { it >= 0 } ?: 0
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun StudioScreen(viewModel: MainViewModel) {
-    val state by viewModel.uiState.collectAsState()
-    val voices by viewModel.voices.collectAsState()
-    var showVoicePicker by remember { mutableStateOf(false) }
-    val selectedVoiceName = resolveVoiceName(state.selectedVoiceId, voices)
-
-    if (showVoicePicker) {
-        VoicePickerSheetV2(
-            voices = voices,
-            selectedVoiceId = state.selectedVoiceId,
-            onDismiss = { showVoicePicker = false },
-            onVoiceSelected = { voiceId ->
-                viewModel.selectVoice(voiceId)
-                showVoicePicker = false
-            },
-        )
-    }
-
-    Box(Modifier.fillMaxSize()) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp)
-                .padding(bottom = 88.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            Text("Text to speech", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
-            state.error?.let { error ->
-                Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodyMedium)
-            }
-            ComposerPanel(
-                state = state,
-                selectedVoiceName = selectedVoiceName,
-                onTextChange = viewModel::updateText,
-                onVoicePickerClick = { if (!state.busy) showVoicePicker = true },
-                onLanguageChange = viewModel::updateLanguage,
-            )
-            if ((state.busy && !state.downloading) || state.sampleCount > 0) {
-                ResultPanel(
-                    state = state,
-                    onPlay = viewModel::playAudio,
-                    onStop = viewModel::stopAudio,
-                )
-            }
-        }
-
-        Surface(
-            tonalElevation = 4.dp,
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth(),
-        ) {
-            Button(
-                onClick = viewModel::synthesize,
-                enabled = state.modelReady && state.text.isNotBlank() && !state.busy,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp)
-                    .height(52.dp),
-            ) {
-                Icon(Icons.AutoMirrored.Filled.VolumeUp, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Text(if (state.busy && !state.downloading) "Generating..." else "Generate")
-            }
-        }
-    }
-}
-
-@Composable
-private fun VoicesScreen(viewModel: MainViewModel) {
-    val state by viewModel.uiState.collectAsState()
-    val voices by viewModel.voices.collectAsState()
-    val recorderState by viewModel.recorderState.collectAsState()
-    val context = LocalContext.current
-    var voiceName by remember { mutableStateOf("") }
-    var hasPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED,
-        )
-    }
-    val importLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        if (uri != null) {
-            viewModel.importVoiceFromUri(uri, voiceName)
-            voiceName = ""
-        }
-    }
-    val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        hasPermission = granted
-        if (granted) viewModel.startVoiceRecording()
-    }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Icon(Icons.Default.Mic, contentDescription = null)
-                    Text("New Voice", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                }
-                OutlinedTextField(
-                    value = voiceName,
-                    onValueChange = { voiceName = it },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true,
-                    label = { Text("Name") },
-                )
-                if (recorderState.isRecording) {
-                    LinearProgressIndicator(
-                        progress = { recorderState.level.coerceIn(0f, 1f) },
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    Text("Recording ${formatDuration(recorderState.elapsedMillis)}", style = MaterialTheme.typography.bodySmall)
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Button(
-                        onClick = {
-                            if (recorderState.isRecording) {
-                                viewModel.stopVoiceRecordingAndCreate(voiceName)
-                                voiceName = ""
-                            } else if (hasPermission) {
-                                viewModel.startVoiceRecording()
-                            } else {
-                                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-                            }
-                        },
-                        enabled = !state.busy || recorderState.isRecording,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Icon(if (recorderState.isRecording) Icons.Default.Stop else Icons.Default.Mic, contentDescription = null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text(if (recorderState.isRecording) "Stop & Create" else "Record")
-                    }
-                    OutlinedButton(
-                        onClick = viewModel::cancelVoiceRecording,
-                        enabled = recorderState.isRecording,
-                        modifier = Modifier.weight(1f),
-                    ) {
-                        Text("Cancel")
-                    }
-                }
-                OutlinedButton(
-                    onClick = { importLauncher.launch(arrayOf("audio/*", "video/*", "application/ogg")) },
-                    enabled = !state.busy && !recorderState.isRecording,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Icon(Icons.Default.AudioFile, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("Клонировать из аудиофайла")
-                }
-                Text(
-                    "mp3 / m4a / ogg / wav / голосовые, 3–30 с чистой речи одного человека без музыки.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-                if (state.supportsCloning == false) {
-                    Text(
-                        "The current model does not expose voice cloning capabilities.",
-                        color = MaterialTheme.colorScheme.error,
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-                }
-            }
-        }
-
-        ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("Готовые голоса", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                PresetVoiceBrowser(selectedVoiceId = state.selectedVoiceId, onSelect = viewModel::selectVoice)
-            }
-        }
-
-        ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                Text("Voices", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                if (voices.isEmpty()) {
-                    Text("No saved voices yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                } else {
-                    voices.forEach { voice ->
-                        VoiceRow(
-                            voice = voice,
-                            selected = state.selectedVoiceId == voice.voiceId,
-                            onSelect = { viewModel.selectVoice(voice.voiceId) },
-                            onDelete = { viewModel.deleteVoice(voice) },
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun HistoryScreen(viewModel: MainViewModel) {
-    val state by viewModel.uiState.collectAsState()
-    val generations by viewModel.generations.collectAsState()
-    var pendingExport by remember { mutableStateOf<GenerationEntity?>(null) }
-    val exportLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.CreateDocument("audio/wav"),
-    ) { uri ->
-        val generation = pendingExport
-        pendingExport = null
-        if (uri != null && generation != null) {
-            viewModel.exportGenerationToUri(generation, uri)
-        }
-    }
-    LazyColumn(
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        if (generations.isEmpty()) {
-            item {
-                Text("No generated audio yet.", color = MaterialTheme.colorScheme.onSurfaceVariant)
-            }
-        }
-        items(generations, key = { it.generationId }) { generation ->
-            val isPlayingThis = state.playing && state.playingGenerationId == generation.generationId
-            var menuExpanded by remember(generation.generationId) { mutableStateOf(false) }
-            ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(generation.text, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                        Text(
-                            "${generation.voiceName} · ${formatSeconds(generation.sampleCount.toDouble() / generation.sampleRate.coerceAtLeast(1))} · ${formatDate(generation.createdAt)}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    Button(
-                        onClick = {
-                            if (isPlayingThis) {
-                                viewModel.stopAudio()
-                            } else {
-                                viewModel.playGeneration(generation.generationId)
-                            }
-                        },
-                    ) {
-                        Icon(
-                            if (isPlayingThis) Icons.Default.Stop else Icons.Default.PlayArrow,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp),
-                        )
-                        Spacer(Modifier.width(6.dp))
-                        Text(if (isPlayingThis) "Stop" else "Play")
-                    }
-                    Box {
-                        IconButton(onClick = { menuExpanded = true }) {
-                            Icon(Icons.Default.MoreVert, contentDescription = "More")
-                        }
-                        DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
-                            DropdownMenuItem(
-                                text = { Text("Export") },
-                                leadingIcon = { Icon(Icons.Default.Download, contentDescription = null) },
-                                onClick = {
-                                    menuExpanded = false
-                                    pendingExport = generation
-                                    exportLauncher.launch(viewModel.suggestedExportFileName(generation))
-                                },
-                            )
-                            DropdownMenuItem(
-                                text = { Text("Delete") },
-                                leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null) },
-                                onClick = {
-                                    menuExpanded = false
-                                    viewModel.deleteGeneration(generation)
-                                },
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SettingsScreen(viewModel: MainViewModel) {
-    val state by viewModel.uiState.collectAsState()
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            QwenModel.variants.forEach { v ->
-                FilterChip(
-                    selected = state.selectedModelId == v.id,
-                    onClick = { viewModel.selectModel(v.id) },
-                    enabled = !state.busy,
-                    label = { Text(if (v.id == QwenModel.customVoiceVariant.id) "CustomVoice (готовые голоса)" else "Base (клонирование)") },
-                )
-            }
-        }
-        ModelPanel(
-            state = state,
-            onDownload = viewModel::downloadModel,
-            onLoad = viewModel::loadModel,
-        )
-        RuntimePanel(
-            state = state,
-            onCpuThreadsChange = viewModel::updateCpuThreads,
-        )
-        ServerPanel()
-    }
-}
-
-@Composable
-private fun ComposerPanel(
-    state: QwenTtsUiState,
-    selectedVoiceName: String,
-    onTextChange: (String) -> Unit,
-    onVoicePickerClick: () -> Unit,
-    onLanguageChange: (Int) -> Unit,
-) {
-    ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            OutlinedTextField(
-                value = state.text,
-                onValueChange = onTextChange,
-                modifier = Modifier.fillMaxWidth(),
-                minLines = 6,
-                maxLines = 10,
-                keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
-                label = { Text("Text") },
-            )
-            OutlinedButton(
-                onClick = onVoicePickerClick,
-                enabled = !state.busy,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Icon(Icons.Default.RecordVoiceOver, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(8.dp))
-                Column(Modifier.weight(1f), horizontalAlignment = Alignment.Start) {
-                    Text("Voice", style = MaterialTheme.typography.labelMedium)
-                    Text(selectedVoiceName, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                }
-            }
-            LanguageDropdown(
-                selectedLanguageId = state.selectedLanguageId,
-                enabled = !state.busy,
-                onLanguageChange = onLanguageChange,
-            )
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun VoicePickerSheet(
-    voices: List<VoiceProfileEntity>,
-    selectedVoiceId: String?,
-    onDismiss: () -> Unit,
-    onVoiceSelected: (String?) -> Unit,
-) {
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 20.dp)
-                .padding(bottom = 28.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Text("Choose voice", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-            VoicePickerItem(
-                title = "Default Voice",
-                subtitle = "Use the built-in speaker",
-                selected = selectedVoiceId == null,
-                onClick = { onVoiceSelected(null) },
-            )
-            voices.forEach { voice ->
-                VoicePickerItem(
-                    title = voice.name,
-                    subtitle = "${formatDuration(voice.durationMillis)} reference",
-                    selected = selectedVoiceId == voice.voiceId,
-                    onClick = { onVoiceSelected(voice.voiceId) },
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun VoicePickerItem(
-    title: String,
-    subtitle: String,
-    selected: Boolean,
-    onClick: () -> Unit,
-) {
-    OutlinedButton(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.weight(1f), horizontalAlignment = Alignment.Start) {
-            Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-        }
-        if (selected) {
-            Icon(Icons.Default.RecordVoiceOver, contentDescription = "Selected", modifier = Modifier.size(18.dp))
-        }
-    }
-}
-
-@Composable
-private fun VoiceRow(
-    voice: VoiceProfileEntity,
-    selected: Boolean,
-    onSelect: () -> Unit,
-    onDelete: () -> Unit,
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-    ) {
-        FilterChip(selected = selected, onClick = onSelect, label = { Text(if (selected) "Active" else "Use") })
-        Column(Modifier.weight(1f)) {
-            Text(voice.name, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(
-                "${formatDuration(voice.durationMillis)} reference · ${formatDate(voice.createdAt)}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        IconButton(onClick = onDelete) {
-            Icon(Icons.Default.Delete, contentDescription = "Delete")
-        }
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-private fun LanguageDropdown(
-    selectedLanguageId: Int,
-    enabled: Boolean,
-    onLanguageChange: (Int) -> Unit,
-) {
-    var expanded by remember { mutableStateOf(false) }
-    val selected = languageOptions.firstOrNull { it.id == selectedLanguageId } ?: languageOptions.first()
-
-    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { if (enabled) expanded = it }) {
-        OutlinedTextField(
-            value = selected.label,
-            onValueChange = {},
-            readOnly = true,
-            enabled = enabled,
-            modifier = Modifier
-                .menuAnchor()
-                .fillMaxWidth(),
-            label = { Text("Language") },
-            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
-        )
-        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-            languageOptions.forEach { option ->
-                DropdownMenuItem(
-                    text = { Text(option.label) },
-                    onClick = {
-                        expanded = false
-                        onLanguageChange(option.id)
-                    },
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun ModelPanel(
-    state: QwenTtsUiState,
-    onDownload: () -> Unit,
-    onLoad: () -> Unit,
-) {
-    val selectedVariant = QwenModel.variantById(state.selectedModelId)
-    ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.GraphicEq, contentDescription = null)
-                Spacer(Modifier.width(10.dp))
-                Column(Modifier.weight(1f)) {
-                    Text(selectedVariant.displayName, style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        "${formatBytes(selectedVariant.totalBytes)} model package",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                AssistChip(onClick = {}, label = { Text(if (state.modelReady) "Ready" else "Missing") })
-            }
-
-            if (state.downloading) {
-                LinearProgressIndicator(progress = { state.downloadProgress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
-                Text("${formatBytes(state.downloadBytes)} / ${formatBytes(state.downloadTotalBytes)}", style = MaterialTheme.typography.bodySmall)
-            }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Button(
-                    onClick = onDownload,
-                    enabled = !state.busy && !state.modelReady,
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text(if (state.modelReady) "Model ready" else "Download model")
-                }
-                OutlinedButton(
-                    onClick = onLoad,
-                    enabled = state.modelReady && !state.loaded && !state.busy,
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Text(if (state.loaded) "Loaded" else "Load")
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun RuntimePanel(
-    state: QwenTtsUiState,
-    onCpuThreadsChange: (Int) -> Unit,
-) {
-    ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                Icon(Icons.Default.Tune, contentDescription = null)
-                Text("Performance", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-            }
-            Text(
-                "CPU backend",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                listOf(4, 6).forEach { threads ->
-                    FilterChip(
-                        selected = state.selectedCpuThreads == threads,
-                        onClick = { onCpuThreadsChange(threads) },
-                        enabled = !state.busy,
-                        label = { Text("$threads threads") },
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ResultPanel(state: QwenTtsUiState, onPlay: () -> Unit, onStop: () -> Unit) {
-    ElevatedCard(colors = CardDefaults.elevatedCardColors(containerColor = MaterialTheme.colorScheme.surface)) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            if (state.busy && !state.downloading) {
-                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                GenerationStats(state)
-            } else {
-                if (state.sampleCount > 0 && state.sampleRate > 0) {
-                    Text(
-                        "Audio ${formatSeconds(state.sampleCount.toDouble() / state.sampleRate.toDouble())} · generated in ${formatDuration(state.synthesisMillis)}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-                Button(
-                    onClick = { if (state.playing) onStop() else onPlay() },
-                    enabled = state.sampleCount > 0,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(52.dp),
-                ) {
-                    Icon(
-                        if (state.playing) Icons.Default.Stop else Icons.Default.PlayArrow,
-                        contentDescription = null,
-                        modifier = Modifier.size(18.dp),
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(if (state.playing) "Stop" else "Play")
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun GenerationStats(state: QwenTtsUiState) {
-    val generatedAudioSeconds = state.synthesisFrames * 0.08
-    val remainingMillis = state.estimatedSynthesisMillis
-        ?.minus(state.operationElapsedMillis)
-        ?.coerceAtLeast(0L)
-
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text(
-            "Elapsed ${formatDuration(state.operationElapsedMillis)}",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        if (state.synthesisFrames > 0) {
-            Text(
-                "Audio so far ~${formatSeconds(generatedAudioSeconds)}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
-        if (remainingMillis != null && state.estimateSampleCount >= 3) {
-            Text(
-                "Estimated remaining ${formatDuration(remainingMillis)}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
+        MiaSettings.get(this)
+        setContent { com.qwen.tts.android.ui.MiaApp() }
     }
 }
 
@@ -1847,7 +1268,7 @@ private fun readWav(path: String): WavData {
     return WavData(samples, sampleRate)
 }
 
-private fun formatBytes(bytes: Long): String {
+internal fun formatBytes(bytes: Long): String {
     if (bytes < 1024L) return "$bytes B"
     val units = arrayOf("KB", "MB", "GB", "TB")
     var value = bytes.toDouble() / 1024.0

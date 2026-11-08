@@ -1,11 +1,13 @@
 package com.qwen.tts.android.server
 
 import android.content.Context
-import com.qwen.tts.android.QwenModel
+import com.qwen.tts.android.data.AudioExporter
+import com.qwen.tts.android.data.LanguageCatalog
+import com.qwen.tts.android.data.MiaSettings
+import com.qwen.tts.android.engine.Synth
 import com.qwen.tts.android.data.SpeakerCatalog
 import com.qwen.tts.android.data.db.QwenDatabase
 import com.qwen.tts.android.engine.EngineHost
-import com.qwen.tts.studio.engine.QwenEngine
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -17,7 +19,6 @@ import java.nio.ByteOrder
 import java.security.MessageDigest
 import java.util.concurrent.Executors
 import kotlin.concurrent.thread
-import kotlin.concurrent.withLock
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
@@ -43,7 +44,7 @@ class ApiServer(
     @Volatile private var running = false
 
     fun start() {
-        val bind = if (prefs.lanAccess) null else InetAddress.getByName("127.0.0.1")
+        val bind = if (prefs.bindHost == "0.0.0.0") null else InetAddress.getByName(prefs.bindHost)
         val socket = ServerSocket(prefs.port, 32, bind)
         serverSocket = socket
         running = true
@@ -164,82 +165,26 @@ class ApiServer(
         val text = json.optString("input", json.optString("text", "")).trim()
         if (text.isEmpty()) throw HttpError(400, "'input' is required")
         val format = json.optString("response_format", "wav").lowercase()
-        val languageId = parseLanguage(json.optString("language", "")) ?: prefs.defaultLanguageId
-
-        val (talker, speakerKey, embeddingPath) = resolveVoice(json.optString("voice", ""))
-        val file = File(modelDir, talker)
-        if (!file.isFile) throw HttpError(503, "Model file $talker is not downloaded. Open the app → Settings.")
-
-        val samples = EngineHost.lock.withLock {
-            val native = EngineHost.ensureLoaded(modelDir.absolutePath, talker, EngineHost.defaultThreads())
-            native.setProgressCallback(null)
-            val all = ArrayList<FloatArray>()
-            for (chunk in splitText(text)) {
-                val r = native.synthesize(
-                    text = chunk,
-                    speakerEmbeddingPath = embeddingPath,
-                    params = QwenEngine.NativeParams(languageId = languageId, speaker = speakerKey),
-                )
-                if (!r.success || r.audio == null) throw HttpError(500, r.errorMsg ?: "Synthesis failed")
-                all += r.audio
-                all += FloatArray(SAMPLE_RATE / 8) // 125 ms pause between chunks
-            }
-            all.fold(FloatArray(0)) { acc, a -> acc + a }
+        val languageId = LanguageCatalog.parse(json.optString("language", "")) ?: prefs.defaultLanguageId
+        val requested = json.optString("voice", "")
+        // Unknown names (e.g. OpenAI's "alloy") fall back to the configured default voice.
+        val voice = Synth.resolve(context, requested)?.takeIf { requested.isNotBlank() }
+            ?: Synth.resolve(context, prefs.defaultVoice)
+            ?: Synth.resolve(context, "vivian")
+            ?: throw HttpError(400, "Unknown voice '$requested'")
+        if (!Synth.isReady(context, voice.talker)) {
+            throw HttpError(503, "Model ${voice.talker} is not downloaded. Open the app, Settings.")
         }
-
-        if (format == "pcm") {
-            writeRaw(out, 200, "audio/pcm", pcm16(samples))
-        } else {
-            writeRaw(out, 200, "audio/wav", wav16(samples))
+        val samples = try {
+            Synth.run(context, text, voice, languageId, MiaSettings.get(context).instruction)
+        } catch (e: Exception) {
+            throw HttpError(500, e.message ?: "Synthesis failed")
         }
+        if (format == "pcm") writeRaw(out, 200, "audio/pcm", pcm16(samples))
+        else writeRaw(out, 200, "audio/wav", AudioExporter.wavBytes(samples, Synth.SAMPLE_RATE))
     }
 
-    /** @return Triple(talker file, preset speaker key or null, speaker embedding path or null) */
-    private fun resolveVoice(requested: String): Triple<String, String?, String?> {
-        val name = requested.trim().ifEmpty { prefs.defaultVoice }
-        fun preset(key: String) = SpeakerCatalog.byKey(key)?.let {
-            Triple(QwenModel.customVoiceVariant.talkerName, it.key, null as String?)
-        }
-        preset(name)?.let { return it }
-        val cloned = runBlocking { dao.getVoices() }.firstOrNull {
-            it.voiceId.equals(name, true) || it.name.equals(name, true)
-        }
-        if (cloned != null) return Triple(QwenModel.defaultVariant.talkerName, null, cloned.speakerEmbeddingPath)
-        // Unknown name (e.g. OpenAI's "alloy"): fall back to the configured default instead of failing.
-        preset(prefs.defaultVoice)?.let { return it }
-        val clonedDefault = runBlocking { dao.getVoices() }.firstOrNull {
-            it.voiceId.equals(prefs.defaultVoice, true) || it.name.equals(prefs.defaultVoice, true)
-        } ?: throw HttpError(400, "Unknown voice '$requested'")
-        return Triple(QwenModel.defaultVariant.talkerName, null, clonedDefault.speakerEmbeddingPath)
-    }
-
-    private fun parseLanguage(value: String): Int? = when (value.trim().lowercase()) {
-        "" -> null
-        "auto" -> -1
-        "en", "english" -> 2050
-        "de", "german" -> 2053
-        "es", "spanish" -> 2054
-        "zh", "chinese" -> 2055
-        "ja", "japanese" -> 2058
-        "fr", "french" -> 2061
-        "ko", "korean" -> 2064
-        "ru", "russian" -> 2069
-        else -> null
-    }
-
-    /** Splits long text into sentence-sized chunks so one request never exceeds the token limit. */
-    private fun splitText(text: String, maxChars: Int = 160): List<String> {
-        val sentences = Regex("[^。！？.!?；;\\n]+[。！？.!?；;]*").findAll(text).map { it.value.trim() }.filter { it.isNotEmpty() }
-        val chunks = ArrayList<String>()
-        val cur = StringBuilder()
-        for (s in sentences) {
-            if (cur.isNotEmpty() && cur.length + s.length + 1 > maxChars) { chunks += cur.toString(); cur.clear() }
-            if (cur.isNotEmpty()) cur.append(' ')
-            cur.append(s)
-        }
-        if (cur.isNotEmpty()) chunks += cur.toString()
-        return chunks.ifEmpty { listOf(text) }
-    }
+    private fun parseLanguage(value: String): Int? = LanguageCatalog.parse(value)
 
     // ---------------------------------------------------------------- output
 
@@ -262,18 +207,6 @@ class ApiServer(
         val buf = ByteBuffer.allocate(samples.size * 2).order(ByteOrder.LITTLE_ENDIAN)
         for (s in samples) buf.putShort((s.coerceIn(-1f, 1f) * 32767f).toInt().toShort())
         return buf.array()
-    }
-
-    private fun wav16(samples: FloatArray): ByteArray {
-        val data = pcm16(samples)
-        val bos = ByteArrayOutputStream(44 + data.size)
-        val h = ByteBuffer.allocate(44).order(ByteOrder.LITTLE_ENDIAN)
-        h.put("RIFF".toByteArray()).putInt(36 + data.size).put("WAVE".toByteArray())
-        h.put("fmt ".toByteArray()).putInt(16).putShort(1).putShort(1)
-            .putInt(SAMPLE_RATE).putInt(SAMPLE_RATE * 2).putShort(2).putShort(16)
-        h.put("data".toByteArray()).putInt(data.size)
-        bos.write(h.array()); bos.write(data)
-        return bos.toByteArray()
     }
 
     companion object {
