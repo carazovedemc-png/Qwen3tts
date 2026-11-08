@@ -1173,13 +1173,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun exportLatest(format: ExportFormat, share: Boolean) {
         val gen = generations.value.firstOrNull() ?: run { say("Сначала озвучьте текст"); return }
+        exportGeneration(gen, format, share)
+    }
+
+    private fun exportOne(gen: GenerationEntity, format: ExportFormat): Pair<android.net.Uri, String> {
+        val (samples, rate) = AudioExporter.readWav(File(gen.wavPath))
+        val name = gen.text.take(24).ifBlank { "voice" } + "-" + gen.generationId
+        return AudioExporter.export(getApplication(), samples, rate, name, format) to name
+    }
+
+    /** Saves (or shares) any item of the history, not only the newest one. */
+    fun exportGeneration(gen: GenerationEntity, format: ExportFormat, share: Boolean = false) {
         val app = getApplication<Application>()
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching {
-                val (samples, rate) = AudioExporter.readWav(File(gen.wavPath))
-                val name = gen.text.take(24).ifBlank { "voice" } + "-" + (System.currentTimeMillis() % 100000)
-                AudioExporter.export(app, samples, rate, name, format) to name
-            }.fold(
+            runCatching { exportOne(gen, format) }.fold(
                 onSuccess = { (uri, name) ->
                     if (share) {
                         val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
@@ -1192,6 +1199,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 },
                 onFailure = { say(it.message ?: "Не удалось сохранить") },
             )
+        }
+    }
+
+    fun exportAll(format: ExportFormat) {
+        val list = generations.value
+        if (list.isEmpty()) { say("История пуста"); return }
+        viewModelScope.launch(Dispatchers.IO) {
+            var ok = 0
+            list.forEach { g -> if (runCatching { exportOne(g, format) }.isSuccess) ok++ }
+            say("Сохранено файлов: $ok из ${list.size}, папка Music/Mia ai voice")
         }
     }
 

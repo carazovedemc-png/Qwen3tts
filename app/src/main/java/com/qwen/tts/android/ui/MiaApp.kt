@@ -9,10 +9,15 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -52,35 +57,55 @@ private fun Root(vm: MainViewModel, settings: MiaSettings, sheet: SheetControlle
     val c = LocalMia.current
     val state by vm.uiState.collectAsState()
     val skyBackdrop = rememberBackdrop()
-    val allBackdrop = rememberBackdrop()
     var tab by rememberSaveable { mutableStateOf(0) }
+    var lastPill by rememberSaveable { mutableStateOf(0) }
+    var historyOpen by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(tab) { if (tab < 3) lastPill = tab }
 
     Box(Modifier.fillMaxSize().background(c.bg)) {
-        Box(Modifier.fillMaxSize().backdropSource(allBackdrop)) {
-            Box(Modifier.fillMaxSize().backdropSource(skyBackdrop)) {
-                if (settings.background == "space") PixelSky(Modifier.fillMaxSize(), color = c.fg)
-            }
-            CompositionLocalProvider(LocalSkyBackdrop provides skyBackdrop) {
-                AnimatedContent(
-                    targetState = tab,
-                    transitionSpec = {
-                        val dir = if (targetState > initialState) 1 else -1
-                        (slideInHorizontally(spring(dampingRatio = 0.8f, stiffness = 260f)) { dir * it / 5 } + fadeIn(tween(260))) togetherWith
-                            (slideOutHorizontally(tween(220)) { -dir * it / 6 } + fadeOut(tween(160)))
-                    },
-                    label = "tabs",
-                ) { t ->
-                    when (t) {
-                        0 -> StudioScreen(vm)
-                        1 -> VoicesScreen(vm)
-                        2 -> QueueScreen(vm)
-                        else -> SettingsScreen(vm)
-                    }
+        Box(Modifier.fillMaxSize().backdropSource(skyBackdrop)) {
+            if (settings.background == "space") PixelSky(Modifier.fillMaxSize(), color = c.fg)
+        }
+        CompositionLocalProvider(LocalSkyBackdrop provides skyBackdrop) {
+            AnimatedContent(
+                targetState = tab,
+                transitionSpec = {
+                    val dir = if (targetState > initialState) 1 else -1
+                    (slideInHorizontally(spring(dampingRatio = 0.8f, stiffness = 260f)) { dir * it / 5 } + fadeIn(tween(260))) togetherWith
+                        (slideOutHorizontally(tween(220)) { -dir * it / 6 } + fadeOut(tween(160)))
+                },
+                label = "tabs",
+            ) { t ->
+                when (t) {
+                    0 -> StudioScreen(vm)
+                    1 -> VoicesScreen(vm)
+                    2 -> QueueScreen(vm)
+                    else -> SettingsScreen(vm)
                 }
             }
-            T("Mia ai voice", 30, display = true, weight = FontWeight.Bold, modifier = Modifier.statusBarsPadding().padding(start = 22.dp, top = 16.dp))
+            // title + history button; swipe down on this strip also opens the history
+            Row(
+                Modifier.fillMaxWidth().statusBarsPadding().padding(start = 22.dp, end = 16.dp, top = 12.dp)
+                    .pointerInput(Unit) {
+                        var total = 0f
+                        detectVerticalDragGestures(onDragStart = { total = 0f }, onDragEnd = { if (total > 50f) historyOpen = true }) { _, dy -> total += dy }
+                    },
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                T("Mia ai voice", 30, display = true, weight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                IconBtn(40, { historyOpen = true }) { historyGlyph(it) }
+            }
         }
-        LiquidBar(tab, { tab = it }, allBackdrop, Modifier.align(Alignment.BottomCenter))
+        DotBottomBar(
+            selectedIndex = lastPill,
+            onSelect = { tab = it },
+            onSettingsClick = { tab = 3 },
+            modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding(),
+            markVisible = tab != 3,
+            settingsActive = tab == 3,
+            dark = c.dark,
+        )
+        CompositionLocalProvider(LocalSkyBackdrop provides skyBackdrop) { HistoryDrop(vm, historyOpen) { historyOpen = false } }
         SheetHost(sheet)
         Toast(state.snackbarMessage) { vm.clearSnackbarMessage() }
         if (!settings.onboarded) {

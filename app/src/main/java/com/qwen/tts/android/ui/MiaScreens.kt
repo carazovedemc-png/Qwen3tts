@@ -52,25 +52,25 @@ private val screenMod = Modifier.fillMaxSize()
 private fun ScreenColumn(content: @Composable ColumnScope.() -> Unit) {
     Column(
         screenMod.fadeTop().verticalScroll(rememberScrollState())
-            .statusBarsPadding().padding(start = 22.dp, end = 22.dp, top = 70.dp, bottom = 130.dp),
+            .statusBarsPadding().padding(start = 22.dp, end = 22.dp, top = 70.dp, bottom = 160.dp),
         content = content,
     )
 }
 
 /* glyphs for icon buttons */
-private fun androidx.compose.ui.graphics.drawscope.DrawScope.playGlyph(c: Color) {
+internal fun androidx.compose.ui.graphics.drawscope.DrawScope.playGlyph(c: Color) {
     val p = Path().apply { moveTo(size.width * .15f, 0f); lineTo(size.width, size.height / 2); lineTo(size.width * .15f, size.height); close() }
     drawPath(p, c)
 }
-private fun androidx.compose.ui.graphics.drawscope.DrawScope.stopGlyph(c: Color) =
+internal fun androidx.compose.ui.graphics.drawscope.DrawScope.stopGlyph(c: Color) =
     drawRect(c, Offset(size.width * .1f, size.height * .1f), Size(size.width * .8f, size.height * .8f))
-private fun androidx.compose.ui.graphics.drawscope.DrawScope.saveGlyph(c: Color) {
+internal fun androidx.compose.ui.graphics.drawscope.DrawScope.saveGlyph(c: Color) {
     val s = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round)
     val w = size.width; val h = size.height
     val p = Path().apply { moveTo(w / 2, 0f); lineTo(w / 2, h * .66f); moveTo(w * .22f, h * .42f); lineTo(w / 2, h * .7f); lineTo(w * .78f, h * .42f); moveTo(0f, h); lineTo(w, h) }
     drawPath(p, c, style = s)
 }
-private fun androidx.compose.ui.graphics.drawscope.DrawScope.crossGlyph(c: Color) {
+internal fun androidx.compose.ui.graphics.drawscope.DrawScope.crossGlyph(c: Color) {
     val s = 2.dp.toPx()
     drawLine(c, Offset(0f, 0f), Offset(size.width, size.height), s, StrokeCap.Round)
     drawLine(c, Offset(size.width, 0f), Offset(0f, size.height), s, StrokeCap.Round)
@@ -185,20 +185,6 @@ fun StudioScreen(vm: MainViewModel) {
             Spacer(Modifier.height(14.dp))
             ResultPlayer(vm, latest, state.playing && state.playingGenerationId == latest.generationId || state.playing && state.playingGenerationId == null)
         }
-        if (gens.size > 1) {
-            Section("История")
-            gens.drop(1).take(12).forEach { g ->
-                Row(Modifier.fillMaxWidth().padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                    IconBtn(36, { if (state.playing && state.playingGenerationId == g.generationId) vm.stopAudio() else vm.playGeneration(g.generationId) }) {
-                        if (state.playing && state.playingGenerationId == g.generationId) stopGlyph(it) else playGlyph(it)
-                    }
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) { T(g.text, 20, maxLines = 1); T(g.voiceName, 16, c.mute) }
-                    IconBtn(36, { vm.deleteGeneration(g) }) { crossGlyph(it) }
-                }
-                HLine()
-            }
-        }
     }
 }
 
@@ -289,8 +275,6 @@ fun VoicesScreen(vm: MainViewModel) {
             (lang == "Все" || p.nativeLanguage.startsWith(ruLang.entries.first { e -> e.value == lang }.key)) && (gender == "Все" || p.gender.label == gender)
         }.forEach { p ->
             Row(Modifier.fillMaxWidth().padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-                IconBtn(38, { vm.previewVoice(p.voiceId) }) { if (previewing == p.voiceId) stopGlyph(it) else playGlyph(it) }
-                Spacer(Modifier.width(12.dp))
                 Column(Modifier.weight(1f).tap { vm.selectVoice(p.voiceId) }) {
                     T(p.displayName); T("${p.gender.label}, ${p.langRu()}" + if (state.selectedVoiceId == p.voiceId) ", выбран" else "", 17, c.mute)
                 }
