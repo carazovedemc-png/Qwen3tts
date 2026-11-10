@@ -6,8 +6,43 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <thread>
+#include <unistd.h>
+#include <android/log.h>
 
 #define LOGE(...) fprintf(stderr, "[QwenEngine_JNI] " __VA_ARGS__); fprintf(stderr, "\n")
+
+
+// ---- Перехват stderr движка: в logcat + кольцевой буфер для монитора в приложении ----
+static std::mutex g_log_mutex;
+static std::string g_engine_log;
+static bool g_stderr_captured = false;
+static const size_t kEngineLogMax = 48 * 1024;
+
+static void start_stderr_capture() {
+    if (g_stderr_captured) return;
+    int fds[2];
+    if (pipe(fds) != 0) return;
+    setvbuf(stderr, nullptr, _IONBF, 0);
+    if (dup2(fds[1], STDERR_FILENO) < 0) { close(fds[0]); close(fds[1]); return; }
+    close(fds[1]);
+    g_stderr_captured = true;
+    const int read_fd = fds[0];
+    std::thread([read_fd]() {
+        char buf[1024];
+        for (;;) {
+            ssize_t n = read(read_fd, buf, sizeof(buf) - 1);
+            if (n <= 0) break;
+            buf[n] = 0;
+            __android_log_write(ANDROID_LOG_INFO, "QwenEngine", buf);
+            std::lock_guard<std::mutex> lock(g_log_mutex);
+            g_engine_log.append(buf, (size_t) n);
+            if (g_engine_log.size() > kEngineLogMax) {
+                g_engine_log.erase(0, g_engine_log.size() - kEngineLogMax);
+            }
+        }
+    }).detach();
+}
 
 static jclass g_result_class = nullptr;
 static jmethodID g_result_constructor = nullptr;
@@ -121,6 +156,7 @@ static void fill_params_from_java(JNIEnv* env, jobject params, qwen3_tts_params_
 extern "C" {
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void* reserved) {
+    start_stderr_capture();
     JNIEnv* env = nullptr;
     if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
@@ -759,6 +795,29 @@ JNIEXPORT jobject JNICALL Java_com_qwen_tts_studio_engine_QwenEngine_nativeGetMo
         (jint)caps.model_kind,
         (jint)caps.speaker_count
     );
+}
+
+
+JNIEXPORT jstring JNICALL Java_com_qwen_tts_studio_engine_QwenEngine_nativeGetEngineLog(
+    JNIEnv* env, jobject thiz
+) {
+    std::string copy;
+    {
+        std::lock_guard<std::mutex> lock(g_log_mutex);
+        copy = g_engine_log;
+    }
+    // NewStringUTF требует корректный UTF-8: заменяем все не-ASCII байты, чтобы не упасть.
+    for (char& c : copy) {
+        if ((unsigned char) c >= 0x80) c = '?';
+    }
+    return env->NewStringUTF(copy.c_str());
+}
+
+JNIEXPORT void JNICALL Java_com_qwen_tts_studio_engine_QwenEngine_nativeClearEngineLog(
+    JNIEnv* env, jobject thiz
+) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    g_engine_log.clear();
 }
 
 }

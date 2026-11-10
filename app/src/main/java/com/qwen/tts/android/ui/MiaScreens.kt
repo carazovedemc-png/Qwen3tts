@@ -40,6 +40,7 @@ import com.qwen.tts.android.MainViewModel
 import com.qwen.tts.android.QwenModel
 import com.qwen.tts.android.data.*
 import com.qwen.tts.android.engine.EngineHost
+import com.qwen.tts.android.engine.PerfMonitor
 import com.qwen.tts.android.formatBytes
 import com.qwen.tts.android.server.ApiServerService
 import com.qwen.tts.android.server.ServerPrefs
@@ -438,6 +439,7 @@ fun SettingsScreen(vm: MainViewModel) {
         NavRow("Процессор", "бэкенд и потоки", backendNames[settings.backend.coerceIn(0, 2)]) {
             sheet.show("Процессор") { ProcessorSheet(vm, mask, backendNames) }
         }
+        NavRow("Монитор скорости", "время, RTF, потоки, отчёт движка", null) { sheet.show("Монитор скорости") { PerfSheet() } }
         SwitchRow("Работа в фоне", "модель в памяти, сервис с уведомлением", settings.keepAlive,
             onChecked = { settings.keepAlive = it; ensureNotifThenSync() },
             onOpen = { sheet.show("Работа в фоне") { BackgroundSheet { ensureNotifThenSync() } } })
@@ -512,6 +514,49 @@ private fun ProcessorSheet(vm: MainViewModel, mask: Int, names: List<String>) {
         SliderRow("Потоки CPU", threads.toFloat(), 1f, 8f, 1f, 0) { vm.updateCpuThreads(it.toInt()) }
         GlassButton("Потоки: авто", { s.threads = 0; vm.restartEngine() })
         state.activeBackendName?.let { KeyValue("Сейчас работает", it) }
+    }
+}
+
+@Composable
+private fun PerfSheet() {
+    val c = LocalMia.current
+    val clip = LocalClipboardManager.current
+    val e = PerfMonitor.last
+    val features = remember { PerfMonitor.cpuFeatures() }
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        if (e == null) {
+            T("Замеров ещё нет. Озвучьте короткую фразу (лучше два раза: первый запуск включает прогрев), затем откройте монитор снова.", 18, c.mute)
+        } else {
+            KeyValue("Голос", e.label)
+            KeyValue("Символов в тексте / кусков", "${e.textChars} / ${e.chunks}")
+            KeyValue("Загрузка/проверка модели", "${e.loadMs} мс")
+            KeyValue("До первого готового куска", "${e.firstChunkMs} мс")
+            KeyValue("Полное время генерации", PerfMonitor.fmt(e.wallMs / 1000.0, 1) + " с")
+            KeyValue("Длительность аудио", PerfMonitor.fmt(e.audioSec, 1) + " с")
+            KeyValue("RTF (меньше 1 = быстрее речи)", PerfMonitor.fmt(e.rtf))
+            KeyValue("Средний RTF за ${PerfMonitor.runs} запусков", PerfMonitor.fmt(PerfMonitor.averageRtf))
+            KeyValue("Потоки CPU", e.threads.toString())
+            KeyValue("Память приложения", "${e.ramMb} МБ")
+        }
+        KeyValue("Ядра процессора", Runtime.getRuntime().availableProcessors().toString())
+        T("Возможности CPU: $features", 17, c.mute)
+        Spacer(Modifier.height(6.dp))
+        T("Отчёт движка по этапам (последний запуск)", 19, c.mute)
+        val summary = PerfMonitor.summarizeLog(PerfMonitor.engineLog)
+        T(summary, 15, c.mute)
+        Spacer(Modifier.height(6.dp))
+        GlassButton("Копировать отчёт целиком", {
+            val text = buildString {
+                e?.let {
+                    append("voice=${it.label} chars=${it.textChars} chunks=${it.chunks} load=${it.loadMs}ms first=${it.firstChunkMs}ms ")
+                    append("wall=${it.wallMs}ms audio=${PerfMonitor.fmt(it.audioSec)}s rtf=${PerfMonitor.fmt(it.rtf)} threads=${it.threads} ram=${it.ramMb}MB\n")
+                }
+                append("cpu: $features\n")
+                append(PerfMonitor.engineLog)
+            }
+            clip.setText(AnnotatedString(text))
+        })
+        GlassButton("Сбросить замеры", { PerfMonitor.reset() })
     }
 }
 

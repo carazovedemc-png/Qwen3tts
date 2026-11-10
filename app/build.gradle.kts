@@ -15,6 +15,8 @@ val qwenOpencl = providers.gradleProperty("qwen.opencl")
     .orElse(false)
 val qwenOpenclSdkDir = providers.gradleProperty("qwen.opencl.sdkDir")
     .orElse(layout.projectDirectory.dir("../build/opencl-sdk").asFile.absolutePath)
+val qwenArmArch = providers.gradleProperty("qwen.armArch")
+    .orElse("armv8.2-a+dotprod+fp16")
 val generatedOpenmpJniLibs = layout.buildDirectory.dir("generated/openmpJniLibs")
 
 val copyOpenmpLibs by tasks.registering {
@@ -85,6 +87,7 @@ android {
                 targets += listOf("qwen3_tts_jni")
                 arguments += listOf(
                     "-DANDROID_STL=c++_shared",
+                    "-DQWEN3_ARM_ARCH=${qwenArmArch.get()}",
                     "-DQWEN3_ANDROID_OPENMP=${if (qwenOpenmp.get()) "ON" else "OFF"}",
                     "-DQWEN3_ANDROID_VULKAN=${if (qwenVulkan.get()) "ON" else "OFF"}",
                     "-DQWEN3_ANDROID_OPENCL=${if (qwenOpencl.get()) "ON" else "OFF"}",

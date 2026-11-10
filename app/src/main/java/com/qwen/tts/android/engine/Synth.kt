@@ -87,9 +87,18 @@ object Synth {
         if (!isReady(context, voice.talker)) error("Model ${voice.talker} is not downloaded")
         val chunks = splitText(text)
         val parts = ArrayList<FloatArray>()
+        val t0 = System.nanoTime()
+        var loadMs = 0L
+        var firstMs = 0L
+        var usedThreads = 0
+        var engineLog = ""
         EngineHost.lock.withLock {
             val native = EngineHost.ensureLoaded(modelDir(context).absolutePath, voice.talker, threads(context), backendPreference(context))
+            loadMs = (System.nanoTime() - t0) / 1_000_000
+            usedThreads = native.getCpuThreads()
             native.setProgressCallback(null)
+            native.clearEngineLog()
+            val genStart = System.nanoTime()
             chunks.forEachIndexed { index, chunk ->
                 if (isCancelled()) error("Cancelled")
                 val r = native.synthesize(
@@ -101,8 +110,26 @@ object Synth {
                 if (!r.success || audio == null) error(r.errorMsg ?: "Synthesis failed")
                 parts += audio
                 parts += FloatArray(SAMPLE_RATE / 8)
+                if (index == 0) firstMs = (System.nanoTime() - genStart) / 1_000_000
                 onChunk?.invoke(index + 1, chunks.size)
             }
+            engineLog = native.getEngineLog()
+            val genMs = (System.nanoTime() - genStart) / 1_000_000
+            val speechSamples = parts.sumOf { it.size } - chunks.size * (SAMPLE_RATE / 8)
+            PerfMonitor.record(
+                PerfMonitor.Entry(
+                    label = voice.label,
+                    textChars = text.length,
+                    chunks = chunks.size,
+                    loadMs = loadMs,
+                    wallMs = genMs,
+                    firstChunkMs = firstMs,
+                    audioSec = speechSamples.coerceAtLeast(0) / SAMPLE_RATE.toDouble(),
+                    threads = usedThreads,
+                    ramMb = PerfMonitor.ramMb(),
+                ),
+                engineLog,
+            )
         }
         val out = FloatArray(parts.sumOf { it.size })
         var pos = 0

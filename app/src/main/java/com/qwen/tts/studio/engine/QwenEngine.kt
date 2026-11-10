@@ -96,6 +96,11 @@ class QwenEngine : AutoCloseable {
             .toList()
     }
 
+    /** Текст stderr движка (таймеры этапов генерации). Последние ~48 КБ. */
+    fun getEngineLog(): String = nativeGetEngineLog().orEmpty()
+
+    fun clearEngineLog() = nativeClearEngineLog()
+
     override fun close() {
         if (nativePtr != 0L) {
             nativeFree(nativePtr)
@@ -103,6 +108,8 @@ class QwenEngine : AutoCloseable {
         }
     }
 
+    private external fun nativeGetEngineLog(): String?
+    private external fun nativeClearEngineLog()
     private external fun nativeInit(): Long
     private external fun nativeFree(ptr: Long)
     private external fun nativeSetBackendPreference(preference: Int): Boolean
